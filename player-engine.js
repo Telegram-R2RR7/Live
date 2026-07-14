@@ -48,6 +48,14 @@ class PlayerEngine extends EventTarget {
     this._bindResilienceEvents();
   }
 
+  /* ══════════════════ بروكسي اختياري (يحل http mixed-content و CORS) ══════════════════ */
+  _proxify(url) {
+    const base = this.opts.proxyBase;
+    if (!base) return url; // بدون بروكسي مُعرَّف: نستخدم الرابط الأصلي كما هو (السلوك القديم)
+    const sep = base.includes('?') ? '&' : '?';
+    return base + sep + 'url=' + encodeURIComponent(url);
+  }
+
   /* ══════════════════ إعدادات HLS مضبوطة لأقصى استقرار واستغلال ══════════════════ */
   _hlsConfig() {
     return {
@@ -156,9 +164,10 @@ class PlayerEngine extends EventTarget {
   }
 
   _playHls(url, label) {
+    const playUrl = this._proxify(url);
     if (window.Hls && Hls.isSupported()) {
       this.hls = new Hls(this._hlsConfig());
-      this.hls.loadSource(url);
+      this.hls.loadSource(playUrl);
       this.hls.attachMedia(this.video);
 
       this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -183,7 +192,7 @@ class PlayerEngine extends EventTarget {
       });
     } else if (this.video.canPlayType('application/vnd.apple.mpegurl')) {
       // Safari / iOS: دعم HLS أصلي
-      this.video.src = url;
+      this.video.src = playUrl;
       this.video.onloadedmetadata = () => {
         this.dispatchEvent(new Event('ready'));
         this.video.play().catch(() => {});
@@ -200,8 +209,9 @@ class PlayerEngine extends EventTarget {
       this._handleFatal('other');
       return;
     }
+    const playUrl = this._proxify(url);
     this.mpegts = mpegts.createPlayer(
-      { type: 'mpegts', isLive: true, url, cors: true, withCredentials: false },
+      { type: 'mpegts', isLive: true, url: playUrl, cors: true, withCredentials: false },
       this._mpegtsConfig()
     );
     this.mpegts.attachMediaElement(this.video);

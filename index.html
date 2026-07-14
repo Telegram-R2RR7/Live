@@ -374,8 +374,14 @@ let channelData = null;
 let allChannels = [];
 let ctrlTimer = null, ctrlVisible = false, isSoftFS = false, lastTap = 0;
 
+/* ⚠️ رابط بروكسي Cloudflare Worker (يحل مشكلة http mixed-content و CORS).
+   بعد نشر الووركر، ضع رابطه هنا (مثال: 'https://my-proxy.username.workers.dev').
+   إذا تركته فارغاً '' يرجع السلوك للوضع القديم (بدون بروكسي). */
+const PROXY_BASE = (window.PROXY_BASE !== undefined) ? window.PROXY_BASE : 'https://broken-bush-62a3.r2rr7-mr77.workers.dev';
+
 // محرك المشغل — كل منطق التشغيل الفعلي بملف player-engine.js المنفصل
 const engine = new PlayerEngine(vid, {
+  proxyBase: PROXY_BASE,
   // مكان مناسب لإضافة رؤوس/توكنات مسموحة أو proxy rewriting لاحقاً:
   requestInterceptor: (xhr, url) => { /* xhr.setRequestHeader('X-Token', '...') */ }
 });
