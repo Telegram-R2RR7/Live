@@ -1,366 +1,352 @@
-/* ══════════════════════════════════════════════════════════
-   PLAYER-ENGINE.JS
-   ──────────────────────────────────────────────────────────
-   محرك تشغيل احترافي كامل — نفس فلسفة المشغلات الاحترافية
-   (كورة لايف وما شابه): يعتمد على قدرات المتصفح عبر hls.js
-   (لصيغة m3u8) و mpegts.js (لبث TS الخام المباشر)، لكن بهندسة
-   مستوى إنتاج حقيقي: استرجاع تلقائي متعدد الطبقات (شبكة،
-   وسائط، مصدر بديل)، مراقب تجمّد ذكي، تبديل جودة بدون تقطيع،
-   استغلال أقصى لعرض النطاق المتاح، وفل سكرين شامل حقيقي.
-
-   ═══ ملاحظة صادقة ═══
-   تغيير User-Agent / Referer الحقيقي على مستوى الشبكة غير
-   ممكن من كود يعمل داخل صفحة متصفح (قيد أمان يفرضه المتصفح
-   نفسه، ولا علاقة له بجودة هذا المحرك). المحرك هنا يدعم مع
-   ذلك "إضافات" فعلية وقابلة للتطبيق فعلاً من طرف العميل:
-   - custom query params / tokens بالرابط
-   - custom XHR headers غير المحجوبة (مثل Authorization،
-     أو أي هيدر بادئته X-)
-   - withCredentials / CORS mode
-   - proxy URL rewriter (لو أردت لاحقاً تمرير الروابط عبر
-     نقطة وسيطة تديرها بنفسك)
-══════════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════════
+   PlayerEngine
+   محرك تشغيل موحّد يدعم:
+     - HLS (m3u8)      عبر hls.js أو التشغيل الأصلي (Safari/iOS)
+     - MPEG-TS خام (.ts) عبر mpegts.js
+     - روابط http عبر بروكسي (لحل مشاكل Mixed Content و CORS)
+     - Fallback تلقائي بين مستويات الجودة عند الفشل
+     - إعادة اتصال تلقائية عند انقطاع الشبكة
+     - استرجاع أخطاء الميديا (recoverMediaError)
+     - كشف التهنيج (stall) وإطلاق حدث buffering/bufferOk
+   يعتمد على: Hls (hls.js) و mpegts (mpegts.js) المُحمّلين مسبقاً
+   ══════════════════════════════════════════════════════════════ */
 
 class PlayerEngine extends EventTarget {
-  /**
-   * @param {HTMLVideoElement} videoEl
-   * @param {Object} opts
-   * @param {(xhr:XMLHttpRequest, url:string)=>void} [opts.requestInterceptor] - لتمرير هيدرز/توكنات مسموحة أو proxy rewriting
-   */
   constructor(videoEl, opts = {}) {
     super();
-    this.video   = videoEl;
-    this.opts    = opts;
-    this.hls     = null;
-    this.mpegts  = null;
-    this.currentSource   = null;
-    this.retries          = 0;
-    this.stallStrikes     = 0;
-    this.lastTime          = 0;
-    this.watchdogTimer     = null;
-    this.userPaused        = false;
-    this.destroyed          = false;
-    this.qualitySources     = [];   // [{label, url}]
-    this.currentQualityIdx  = -1;
-    this.qualityFallbackTried = new Set();
+    this.video = videoEl;
+    this.proxyBase = opts.proxyBase || '';
+    this.requestInterceptor = typeof opts.requestInterceptor === 'function' ? opts.requestInterceptor : null;
 
-    this._bindMediaEvents();
-    this._bindResilienceEvents();
+    this.qualitySources = [];      // [{label, url}, ...]
+    this.currentQualityIdx = 0;
+    this.qualityFallbackTried = new Set(); // فهارس الجودات التي جُرِّبت وفشلت بالمحاولة الحالية
+
+    this.hls = null;               // نسخة hls.js الحالية
+    this.mpegtsPlayer = null;      // نسخة mpegts.js الحالية
+    this._usingNativeHls = false;  // تشغيل HLS أصلي (Safari) بدون hls.js
+
+    this._reconnectAttempts = 0;
+    this._maxReconnectAttempts = 5;
+    this._reconnectTimer = null;
+
+    this._stallTimer = null;
+    this._stallThresholdMs = 8000;   // إذا استمر buffering أكثر من هذه المدة نعتبره تهنيج حقيقي
+    this._isBuffering = false;
+
+    this._loadToken = 0; // لمنع سباقات التحميل عند تبديل الجودة بسرعة
+
+    this._bindVideoEvents();
   }
 
-  /* ══════════════════ بروكسي اختياري (يحل http mixed-content و CORS) ══════════════════ */
-  _proxify(url) {
-    const base = this.opts.proxyBase;
-    if (!base) return url; // بدون بروكسي مُعرَّف: نستخدم الرابط الأصلي كما هو (السلوك القديم)
-    const sep = base.includes('?') ? '&' : '?';
-    return base + sep + 'url=' + encodeURIComponent(url);
-  }
+  /* ────────────── أدوات مساعدة ثابتة ────────────── */
 
-  /* ══════════════════ إعدادات HLS مضبوطة لأقصى استقرار واستغلال ══════════════════ */
-  _hlsConfig() {
-    return {
-      enableWorker: true,
-      lowLatencyMode: false,
-      startLevel: -1,
-
-      // مخزن مؤقت كبير جداً يمتص أي تذبذب شبكة بدون أي تقطيع محسوس
-      maxBufferLength: 45,
-      maxMaxBufferLength: 600,
-      backBufferLength: 90,
-      maxBufferSize: 150 * 1000 * 1000,
-      maxBufferHole: 1.5,
-
-      // ABR: يستنزف أقصى عرض نطاق متاح، وينزل جودة فقط عند الحاجة الحقيقية
-      capLevelToPlayerSize: false,
-      testBandwidth: true,
-      abrEwmaFastLive: 2.5,
-      abrEwmaSlowLive: 7.0,
-      abrBandWidthFactor: 0.92,
-      abrBandWidthUpFactor: 0.65,
-      abrMaxWithRealBitrate: true,
-
-      liveSyncDurationCount: 5,
-      liveMaxLatencyDurationCount: 15,
-      liveDurationInfinity: true,
-
-      manifestLoadingMaxRetry: 4,
-      manifestLoadingRetryDelay: 1500,
-      levelLoadingMaxRetry: 4,
-      levelLoadingRetryDelay: 1500,
-      fragLoadingMaxRetry: 6,
-      fragLoadingRetryDelay: 1000,
-
-      nudgeMaxRetry: 8,
-      nudgeOffset: 0.15,
-      maxFragLookUpTolerance: 0.3,
-      appendErrorMaxRetry: 6,
-
-      xhrSetup: (xhr, url) => {
-        xhr.withCredentials = false;
-        if (this.opts.requestInterceptor) this.opts.requestInterceptor(xhr, url);
-      },
-    };
-  }
-
-  _mpegtsConfig() {
-    return {
-      enableWorker: true,
-
-      // مخزن مؤقت كبير جداً — يمتص أي تذبذب أو بطء مؤقت بالشبكة
-      // قبل ما يوصل تأثيره للمشاهد كتقطيع محسوس
-      enableStashBuffer: true,
-      stashInitialSize: 4 * 1024 * 1024,   // ~4MB بافر ابتدائي
-
-      // لا توقف السحب أبداً طالما الاتصال حي — استنزاف كامل للرابط
-      lazyLoad: false,
-      lazyLoadMaxDuration: 0,
-      deferLoadAfterSourceOpen: false,
-
-      // إيقاف "اللحاق" العدواني بحافة البث الحي — هذا هو اللي كان
-      // يسبب قفزات/تسريع تشغيل مفاجئ (liveSyncPlaybackRate) وتقطيع محسوس.
-      // نفضّل استقرار كامل على أقل زمن انتقال ممكن
-      liveBufferLatencyChasing: false,
-      liveSync: false,
-
-      autoCleanupSourceBuffer: true,
-      autoCleanupMaxBackwardDuration: 60,
-      autoCleanupMinBackwardDuration: 30,
-
-      fixAudioTimestampGap: true,
-      accurateSeek: false,
-      seekType: 'range',
-    };
-  }
-
-  /* ══════════════════ كشف نوع المصدر ══════════════════ */
   static isRawTs(url) {
-    try { return /\.ts($|\?|#)/i.test(url.split('?')[0].split('#')[0]); }
-    catch (e) { return false; }
+    if (!url) return false;
+    const clean = String(url).split('?')[0].split('#')[0];
+    return /\.ts$/i.test(clean);
   }
 
-  /* ══════════════════ تحميل قائمة جودات القناة ══════════════════ */
-  setQualitySources(sources /* [{label,url}] */) {
-    this.qualitySources = sources || [];
+  static isM3u8(url) {
+    if (!url) return false;
+    const clean = String(url).split('?')[0].split('#')[0];
+    return /\.m3u8$/i.test(clean);
   }
 
-  /* ══════════════════ تشغيل جودة محددة ══════════════════ */
+  /* ────────────── ضبط مصادر الجودة ────────────── */
+
+  setQualitySources(sources) {
+    this.qualitySources = Array.isArray(sources) ? sources : [];
+    this.currentQualityIdx = 0;
+    this.qualityFallbackTried.clear();
+  }
+
+  /* ────────────── حل الرابط (بروكسي عند الحاجة) ────────────── */
+
+  _resolveUrl(url) {
+    if (!url) return url;
+    const isHttp = /^http:\/\//i.test(url);
+    const pageIsHttps = location.protocol === 'https:';
+    // نمرر عبر البروكسي فقط إذا الرابط http والصفحة https (مشكلة mixed content)
+    // أو إذا تم تفعيل البروكسي دائماً من الإعدادات
+    if (this.proxyBase && isHttp && pageIsHttps) {
+      const base = this.proxyBase.replace(/\/+$/, '');
+      return `${base}/proxy?url=${encodeURIComponent(url)}`;
+    }
+    return url;
+  }
+
+  /* ────────────── إشعال حدث مساعد ────────────── */
+
+  _emit(name, detail) {
+    this.dispatchEvent(new CustomEvent(name, { detail }));
+  }
+
+  /* ────────────── تشغيل جودة معيّنة ────────────── */
+
   playQuality(idx) {
     if (idx < 0 || idx >= this.qualitySources.length) return;
     this.currentQualityIdx = idx;
-    this.qualityFallbackTried.clear();
-    this._playUrl(this.qualitySources[idx].url, this.qualitySources[idx].label);
-  }
-
-  _playUrl(url, label) {
-    this.currentSource = { url, label };
-    this.retries = 0;
-    this.stallStrikes = 0;
-    this.userPaused = false;
+    this._reconnectAttempts = 0;
+    clearTimeout(this._reconnectTimer);
     this._teardownActivePlayers();
-    this.dispatchEvent(new CustomEvent('loading', { detail: { label } }));
 
-    if (PlayerEngine.isRawTs(url)) this._playMpegts(url, label);
-    else this._playHls(url, label);
+    const token = ++this._loadToken;
+    const source = this.qualitySources[idx];
+    this._emit('loading');
+    this._loadSource(source, idx, token);
   }
 
-  _playHls(url, label) {
-    const playUrl = this._proxify(url);
+  _loadSource(source, idx, token) {
+    if (!source || !source.url) { this._emit('fatal', 'رابط البث غير صالح.'); return; }
+    const resolvedUrl = this._resolveUrl(source.url);
+
+    if (PlayerEngine.isRawTs(source.url)) {
+      this._loadWithMpegts(resolvedUrl, idx, token);
+    } else {
+      this._loadWithHls(resolvedUrl, idx, token);
+    }
+  }
+
+  /* ────────────── تشغيل HLS (m3u8) ────────────── */
+
+  _loadWithHls(url, idx, token) {
+    const video = this.video;
+
     if (window.Hls && Hls.isSupported()) {
-      this.hls = new Hls(this._hlsConfig());
-      this.hls.loadSource(playUrl);
-      this.hls.attachMedia(this.video);
+      const hls = new Hls({
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        liveSyncDurationCount: 3,
+        enableWorker: true,
+        lowLatencyMode: false,
+        xhrSetup: (xhr, xhrUrl) => {
+          if (this.requestInterceptor) {
+            try { this.requestInterceptor(xhr, xhrUrl); } catch (e) {}
+          }
+        }
+      });
+      this.hls = hls;
+      this._usingNativeHls = false;
 
-      this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        this.dispatchEvent(new Event('ready'));
-        this.video.play().catch(() => {});
-        this._startWatchdog();
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (token !== this._loadToken) return;
+        this._reconnectAttempts = 0;
+        video.play().catch(() => {});
+        this._emit('ready');
       });
 
-      this.hls.on(Hls.Events.LEVEL_SWITCHED, (_, d) => {
-        const lvl = this.hls.levels?.[d.level];
-        this.dispatchEvent(new CustomEvent('levelSwitched', {
-          detail: { label, height: lvl?.height }
-        }));
+      hls.on(Hls.Events.LEVEL_SWITCHED, (_evt, data) => {
+        if (token !== this._loadToken) return;
+        const level = hls.levels && hls.levels[data.level];
+        this._emit('levelSwitched', {
+          label: this.qualitySources[idx]?.label || 'تلقائي',
+          height: level?.height || null
+        });
       });
 
-      this.hls.on(Hls.Events.FRAG_BUFFERED, () => this.dispatchEvent(new Event('bufferOk')));
+      hls.on(Hls.Events.ERROR, (_evt, data) => {
+        if (token !== this._loadToken) return;
+        if (!data.fatal) return;
 
-      this.hls.on(Hls.Events.ERROR, (_, d) => {
-        if (!d.fatal) return;
-        this._handleFatal(d.type === Hls.ErrorTypes.NETWORK_ERROR ? 'network'
-                          : d.type === Hls.ErrorTypes.MEDIA_ERROR ? 'media' : 'other');
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            this._handleNetworkError(idx, token, () => hls.startLoad());
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            this._emit('recoveringMedia');
+            try { hls.recoverMediaError(); } catch (e) { this._tryFallbackOrFatal(idx, token); }
+            break;
+          default:
+            this._tryFallbackOrFatal(idx, token);
+            break;
+        }
       });
-    } else if (this.video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari / iOS: دعم HLS أصلي
-      this.video.src = playUrl;
-      this.video.onloadedmetadata = () => {
-        this.dispatchEvent(new Event('ready'));
-        this.video.play().catch(() => {});
-        this._startWatchdog();
+
+      hls.loadSource(url);
+      hls.attachMedia(video);
+
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // دعم HLS أصلي (Safari / iOS)
+      this._usingNativeHls = true;
+      video.src = url;
+
+      const onLoaded = () => {
+        if (token !== this._loadToken) return;
+        video.removeEventListener('loadedmetadata', onLoaded);
+        video.play().catch(() => {});
+        this._emit('ready');
       };
-      this.video.onerror = () => this._handleFatal('other');
+      video.addEventListener('loadedmetadata', onLoaded);
+
+      const onError = () => {
+        if (token !== this._loadToken) return;
+        this._handleNetworkError(idx, token, () => {
+          video.src = url;
+          video.load();
+          video.play().catch(() => {});
+        });
+      };
+      video.addEventListener('error', onError, { once: true });
+
     } else {
-      this.dispatchEvent(new CustomEvent('fatal', { detail: 'المتصفح لا يدعم بث HLS.' }));
+      this._emit('fatal', 'المتصفح لا يدعم تشغيل HLS.');
     }
   }
 
-  _playMpegts(url, label) {
-    if (!(window.mpegts && mpegts.isSupported())) {
-      this._handleFatal('other');
+  /* ────────────── تشغيل MPEG-TS خام ────────────── */
+
+  _loadWithMpegts(url, idx, token) {
+    const video = this.video;
+
+    if (!window.mpegts || !mpegts.isSupported()) {
+      this._emit('fatal', 'المتصفح لا يدعم تشغيل بث TS الخام.');
       return;
     }
-    const playUrl = this._proxify(url);
-    this.mpegts = mpegts.createPlayer(
-      { type: 'mpegts', isLive: true, url: playUrl, cors: true, withCredentials: false },
-      this._mpegtsConfig()
-    );
-    this.mpegts.attachMediaElement(this.video);
 
-    this.mpegts.on(mpegts.Events.MEDIA_INFO, () => {
-      // ننتظر تجمّع بافر أولي (بدل التشغيل الفوري) لتفادي أي
-      // تقطيع بلحظات البداية — استنزاف الرابط يبدأ فوراً بالخلفية
-      // بأقصى سرعة، لكن العرض الفعلي يتأخر قليلاً لضمان سلاسة كاملة
-      setTimeout(() => {
-        this.dispatchEvent(new Event('ready'));
-        this.mpegts.play().catch(() => {});
-        this._startWatchdog();
-      }, 1800);
-    });
-    this.mpegts.on(mpegts.Events.STATISTICS_INFO, () => this.dispatchEvent(new Event('bufferOk')));
-    this.mpegts.on(mpegts.Events.ERROR, (type) => {
-      this._handleFatal(type === mpegts.ErrorTypes.NETWORK_ERROR ? 'network'
-                        : type === mpegts.ErrorTypes.MEDIA_ERROR ? 'media' : 'other');
+    const player = mpegts.createPlayer({
+      type: 'mpegts',
+      isLive: true,
+      url
+    }, {
+      enableWorker: true,
+      liveBufferLatencyChasing: true,
+      liveSync: true
     });
 
-    try { this.mpegts.load(); this.mpegts.play().catch(() => {}); }
-    catch (e) { this._handleFatal('other'); }
+    this.mpegtsPlayer = player;
+    this._usingNativeHls = false;
+
+    player.on(mpegts.Events.ERROR, () => {
+      if (token !== this._loadToken) return;
+      this._handleNetworkError(idx, token, () => {
+        try { player.unload(); player.load(); player.play(); } catch (e) {}
+      });
+    });
+
+    player.on(mpegts.Events.LOADING_COMPLETE, () => {
+      if (token !== this._loadToken) return;
+      this._emit('levelSwitched', { label: this.qualitySources[idx]?.label || 'مباشر', height: null });
+    });
+
+    player.attachMediaElement(video);
+    player.load();
+    player.play().then(() => {
+      if (token !== this._loadToken) return;
+      this._emit('ready');
+    }).catch(() => {
+      if (token !== this._loadToken) return;
+      this._emit('ready'); // بعض المتصفحات ترفض autoplay بالصوت، الواجهة تعالج الضغط اليدوي
+    });
   }
 
-  /* ══════════════════ استرجاع متعدد الطبقات عند الفشل ══════════════════ */
-  _handleFatal(kind) {
-    if (kind === 'network' && this.retries < 5) {
-      this.retries++;
-      this.dispatchEvent(new CustomEvent('reconnecting', { detail: this.retries }));
-      setTimeout(() => {
-        if (this.hls) { try { this.hls.startLoad(); } catch (e) { this._hardRestart(); } }
-        else if (this.mpegts) {
-          try { this.mpegts.unload(); this.mpegts.load(); this.mpegts.play().catch(() => {}); }
-          catch (e) { this._hardRestart(); }
-        }
-      }, 1500 + this.retries * 600);
+  /* ────────────── معالجة أخطاء الشبكة (إعادة اتصال) ────────────── */
+
+  _handleNetworkError(idx, token, resumeFn) {
+    if (this._reconnectAttempts >= this._maxReconnectAttempts) {
+      this._tryFallbackOrFatal(idx, token);
       return;
     }
-    if (kind === 'media' && this.retries < 3) {
-      this.retries++;
-      this.dispatchEvent(new Event('recoveringMedia'));
-      if (this.hls) { try { this.hls.recoverMediaError(); return; } catch (e) {} }
-      this._hardRestart();
-      return;
-    }
-    this._tryQualityFallbackOrFail();
+    this._reconnectAttempts++;
+    this._emit('reconnecting', this._reconnectAttempts);
+
+    clearTimeout(this._reconnectTimer);
+    const delay = Math.min(1000 * this._reconnectAttempts, 5000);
+    this._reconnectTimer = setTimeout(() => {
+      if (token !== this._loadToken) return;
+      try { resumeFn(); } catch (e) { this._tryFallbackOrFatal(idx, token); }
+    }, delay);
   }
 
-  _tryQualityFallbackOrFail() {
-    this.qualityFallbackTried.add(this.currentQualityIdx);
+  /* ────────────── الانتقال لجودة أخرى عند الفشل النهائي ────────────── */
+
+  _tryFallbackOrFatal(idx, token) {
+    this.qualityFallbackTried.add(idx);
+
     const nextIdx = this.qualitySources.findIndex((_, i) => !this.qualityFallbackTried.has(i));
-    if (nextIdx !== -1 && this.qualitySources.length > 1) {
+    if (nextIdx !== -1) {
+      this._emit('fallback', { label: this.qualitySources[nextIdx]?.label || '' });
+      this._teardownActivePlayers();
       this.currentQualityIdx = nextIdx;
-      this.dispatchEvent(new CustomEvent('fallback', { detail: this.qualitySources[nextIdx] }));
-      setTimeout(() => this._playUrl(this.qualitySources[nextIdx].url, this.qualitySources[nextIdx].label), 800);
+      this._reconnectAttempts = 0;
+      const newToken = ++this._loadToken;
+      this._loadSource(this.qualitySources[nextIdx], nextIdx, newToken);
     } else {
-      this.dispatchEvent(new CustomEvent('fatal', { detail: 'تعذّر التشغيل بعد تجربة كل الجودات المتاحة.' }));
+      this._emit('fatal', 'تعذّر تشغيل البث من جميع الروابط المتاحة.');
     }
   }
 
-  _hardRestart() {
-    this._teardownActivePlayers();
-    setTimeout(() => this.currentSource && this._playUrl(this.currentSource.url, this.currentSource.label), 500);
-  }
-
-  /* ══════════════════ مراقب التجمّد (Stall Watchdog) ══════════════════ */
-  _startWatchdog() {
-    this._stopWatchdog();
-    this.lastTime = this.video.currentTime;
-    this.stallStrikes = 0;
-    this.watchdogTimer = setInterval(() => {
-      if (this.userPaused || this.video.paused || document.hidden) return;
-      if (Math.abs(this.video.currentTime - this.lastTime) < 0.05) {
-        this.stallStrikes++;
-        if (this.stallStrikes >= 3) {
-          this.stallStrikes = 0;
-          this.dispatchEvent(new Event('stallDetected'));
-          try {
-            if (this.hls) this.hls.startLoad();
-            else if (this.mpegts) { this.mpegts.unload(); this.mpegts.load(); this.mpegts.play().catch(() => {}); }
-            this.video.currentTime += 0.2;
-          } catch (e) { this._hardRestart(); }
-        }
-      } else this.stallStrikes = 0;
-      this.lastTime = this.video.currentTime;
-    }, 4000);
-  }
-  _stopWatchdog() { if (this.watchdogTimer) clearInterval(this.watchdogTimer); this.watchdogTimer = null; }
-
-  /* ══════════════════ استرجاع عند العودة من الخلفية / الاتصال ══════════════════ */
-  _bindResilienceEvents() {
-    this._onlineHandler = () => {
-      if (!this.currentSource) return;
-      if (this.hls) { try { this.hls.startLoad(); } catch (e) { this._hardRestart(); } }
-      else if (this.mpegts) { try { this.mpegts.unload(); this.mpegts.load(); this.mpegts.play().catch(() => {}); } catch (e) { this._hardRestart(); } }
-    };
-    window.addEventListener('online', this._onlineHandler);
-
-    this._hiddenAt = 0;
-    this._visHandler = () => {
-      if (document.hidden) { this._hiddenAt = Date.now(); return; }
-      if (!this.currentSource) return;
-      const away = Date.now() - this._hiddenAt;
-      if (away > 15000) this._hardRestart();
-      else if (this.hls) { try { this.hls.startLoad(); } catch (e) {} }
-      else if (this.mpegts) { try { this.mpegts.unload(); this.mpegts.load(); this.mpegts.play().catch(() => {}); } catch (e) {} }
-    };
-    document.addEventListener('visibilitychange', this._visHandler);
-  }
-
-  /* ══════════════════ أحداث الوسائط الأساسية ══════════════════ */
-  _bindMediaEvents() {
-    this.video.addEventListener('waiting', () => this.dispatchEvent(new Event('buffering')));
-    this.video.addEventListener('playing', () => this.dispatchEvent(new Event('bufferOk')));
-    this.video.addEventListener('stalled', () => this.dispatchEvent(new Event('buffering')));
-    this.video.addEventListener('play',    () => this.dispatchEvent(new Event('playStateChanged')));
-    this.video.addEventListener('pause',   () => this.dispatchEvent(new Event('playStateChanged')));
-  }
-
-  /* ══════════════════ تحكم عام ══════════════════ */
-  togglePlay() {
-    if (this.video.paused) { this.userPaused = false; this.video.play().catch(() => {}); }
-    else { this.userPaused = true; this.video.pause(); }
-  }
-  setVolume(v) { this.video.volume = v; this.video.muted = v === 0; }
-  toggleMute() { this.video.muted = !this.video.muted; }
+  /* ────────────── إيقاف/تفكيك المشغلات الحالية ────────────── */
 
   _teardownActivePlayers() {
-    this._stopWatchdog();
-    if (this.hls) { try { this.hls.destroy(); } catch (e) {} this.hls = null; }
-    if (this.mpegts) {
-      try { this.mpegts.pause(); } catch (e) {}
-      try { this.mpegts.unload(); } catch (e) {}
-      try { this.mpegts.detachMediaElement(); } catch (e) {}
-      try { this.mpegts.destroy(); } catch (e) {}
-      this.mpegts = null;
+    clearTimeout(this._stallTimer);
+    this._stallTimer = null;
+
+    if (this.hls) {
+      try { this.hls.destroy(); } catch (e) {}
+      this.hls = null;
     }
-    try { this.video.pause(); } catch (e) {}
-    this.video.removeAttribute('src');
-    this.video.src = '';
-    this.video.load();
+    if (this.mpegtsPlayer) {
+      try {
+        this.mpegtsPlayer.pause();
+        this.mpegtsPlayer.unload();
+        this.mpegtsPlayer.detachMediaElement();
+        this.mpegtsPlayer.destroy();
+      } catch (e) {}
+      this.mpegtsPlayer = null;
+    }
+    try {
+      this.video.removeAttribute('src');
+      this.video.load();
+    } catch (e) {}
+    this._usingNativeHls = false;
   }
 
-  destroy() {
-    this.destroyed = true;
-    this._teardownActivePlayers();
-    window.removeEventListener('online', this._onlineHandler);
-    document.removeEventListener('visibilitychange', this._visHandler);
+  /* ────────────── التحكم بالتشغيل ────────────── */
+
+  togglePlay() {
+    if (this.video.paused) this.video.play().catch(() => {});
+    else this.video.pause();
+  }
+
+  toggleMute() {
+    this.video.muted = !this.video.muted;
+  }
+
+  setVolume(v) {
+    this.video.volume = v;
+    if (v > 0 && this.video.muted) this.video.muted = false;
+  }
+
+  /* ────────────── ربط أحداث عنصر الفيديو ────────────── */
+
+  _bindVideoEvents() {
+    const video = this.video;
+
+    video.addEventListener('play',  () => this._emit('playStateChanged'));
+    video.addEventListener('pause', () => this._emit('playStateChanged'));
+
+    video.addEventListener('waiting', () => {
+      this._isBuffering = true;
+      this._emit('buffering');
+      clearTimeout(this._stallTimer);
+      this._stallTimer = setTimeout(() => {
+        if (this._isBuffering) this._emit('stallDetected');
+      }, this._stallThresholdMs);
+    });
+
+    video.addEventListener('playing', () => {
+      this._isBuffering = false;
+      clearTimeout(this._stallTimer);
+      this._emit('bufferOk');
+    });
+
+    video.addEventListener('canplay', () => {
+      if (this._isBuffering) {
+        this._isBuffering = false;
+        clearTimeout(this._stallTimer);
+        this._emit('bufferOk');
+      }
+    });
   }
 }
-
-window.PlayerEngine = PlayerEngine;
